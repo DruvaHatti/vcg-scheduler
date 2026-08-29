@@ -1,2 +1,5 @@
 auctioneer
 bidder
+benchmark
+test_policies
+*.o
