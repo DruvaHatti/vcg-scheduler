@@ -1,147 +1,181 @@
-#include<iostream>
-#include<sys/socket.h>
-#include<netinet/in.h>
-#include<signal.h>
-#include<unistd.h>
-#include<vector>
-#include<sys/select.h>
-#include "../include/protocol.h"
-#include<map>
-#include<algorithm>
+#include <iostream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <unistd.h>
+#include <vector>
+#include <algorithm>
+#include <cstring>
+#include <cerrno>
+#include <sys/select.h>
 
-int main()
-{
-    int sock=socket(AF_INET,SOCK_DGRAM,0);
-    struct sockaddr_in serv_addr;
-    serv_addr.sin_family=AF_INET;
-    serv_addr.sin_port=htons(8080);
-    serv_addr.sin_addr.s_addr=INADDR_ANY;
-    if(bind(sock,(struct sockaddr*)&serv_addr,sizeof(serv_addr))<0)
-    {
-        std::cerr<<"Binding failed!"<<std::endl;
+#include "../include/protocol.h"
+#include "../include/job.h"
+#include "../include/scheduler_policy.h"
+#include "../include/policies/vcg_auction_policy.h"
+
+namespace {
+
+volatile sig_atomic_t g_shutdownRequested = 0;
+void handleSigint(int) { g_shutdownRequested = 1; }
+
+// Sending signal 0 delivers nothing but still runs the kernel's
+// existence/permission check - the standard portable way to test
+// "is this PID still alive" without actually signalling it. We use this
+// instead of SIGCHLD because bidder processes are launched independently
+// by the user, not fork()'d by the auctioneer, so they are never our
+// children and we'd never receive SIGCHLD for them.
+bool isProcessAlive(pid_t pid) {
+    return kill(pid, 0) == 0;
+}
+
+constexpr int BIDDING_WINDOW_SECONDS = 5;
+constexpr int PORT = 8080;
+
+} // namespace
+
+int main() {
+    signal(SIGINT, handleSigint);
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        std::cerr << "Failed to create socket: " << strerror(errno) << "\n";
         return 1;
     }
-    std::cout<<"Auctioneer is active on port 8080..."<<std::endl;
-    std::map<pid_t,int> accounts;
-    int round_num=1;
-    std::vector<Bid> active_jobs;
-    pid_t currently_running_pid=-1;
-    while(true)
-    {
-        std::cout<<"\n==================================="<<std::endl;
-        std::cout<<"Starting Round "<<round_num++<<"..."<<std::endl;
-        std::cout<<"Bidding window open for 5 seconds..."<<std::endl;
-        
-        struct timeval tv;
-        tv.tv_sec=5;
-        tv.tv_usec=0;
+
+    struct sockaddr_in servAddr{};
+    servAddr.sin_family = AF_INET;
+    servAddr.sin_port = htons(PORT);
+    servAddr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(sock, (struct sockaddr*)&servAddr, sizeof(servAddr)) < 0) {
+        std::cerr << "Bind failed on port " << PORT << ": " << strerror(errno) << "\n";
+        close(sock);
+        return 1;
+    }
+
+    std::cout << "Auctioneer active on port " << PORT << ". Press Ctrl+C to stop.\n";
+
+    VcgAuctionPolicy policy;
+    std::vector<Job> jobs;
+    pid_t currentlyRunningPid = -1;
+    int round = 1;
+
+    while (!g_shutdownRequested) {
+        std::cout << "\n===================================\n";
+        std::cout << "Round " << round << " - bidding window open for "
+                  << BIDDING_WINDOW_SECONDS << "s...\n";
+
+        struct timeval tv{BIDDING_WINDOW_SECONDS, 0};
         fd_set readfds;
 
-        //std::cout<<"Bidding window open for 5 seconds. Waiting for bidders..."<<std::endl;
-        while(true)
-        {
+        while (!g_shutdownRequested) {
             FD_ZERO(&readfds);
-            FD_SET(sock,&readfds);
+            FD_SET(sock, &readfds);
 
-            int activity=select(sock+1,&readfds,NULL,NULL,&tv);
-
-            if(activity<0)
-            {
-                std::cerr<<"Select error occured!"<<std::endl;
+            int activity = select(sock + 1, &readfds, nullptr, nullptr, &tv);
+            if (activity < 0) {
+                if (errno == EINTR) break; // interrupted by SIGINT
+                std::cerr << "select() error: " << strerror(errno) << "\n";
                 break;
             }
-            else if(activity==0)
-            {
-                std::cout<<"\n--- Bidding Window Closed! ---"<<std::endl;
+            if (activity == 0) {
+                std::cout << "--- Bidding window closed ---\n";
                 break;
             }
-            if(FD_ISSET(sock,&readfds))
-            {
-                Bid incoming;
-                struct sockaddr_in client_addr;
-                socklen_t addr_len=sizeof(client_addr);
+            if (FD_ISSET(sock, &readfds)) {
+                uint8_t buffer[BID_MESSAGE_WIRE_SIZE];
+                struct sockaddr_in clientAddr{};
+                socklen_t addrLen = sizeof(clientAddr);
 
-                recvfrom(sock,&incoming,sizeof(incoming),0,(struct sockaddr*)&client_addr,&addr_len);
-                bool is_new_job=true;
-                for(const auto& job:active_jobs)
-                {
-                    if(job.process_id==incoming.process_id) is_new_job=false;
+                ssize_t received = recvfrom(sock, buffer, sizeof(buffer), 0,
+                                             (struct sockaddr*)&clientAddr, &addrLen);
+                if (received != static_cast<ssize_t>(BID_MESSAGE_WIRE_SIZE)) {
+                    std::cerr << "Dropped malformed packet (" << received
+                              << " bytes, expected " << BID_MESSAGE_WIRE_SIZE << ")\n";
+                    continue;
                 }
-                if(is_new_job)
-                {
-                    accounts[incoming.process_id]=1000;
-                    active_jobs.push_back(incoming);
-                    std::cout<<"New process entered. PID: "<<incoming.process_id<<" (Target Bid: "<<incoming.value<<")"<<std::endl;
-                    if(kill(incoming.process_id,SIGSTOP)==0)
-                    {
-                        std::cout<<"Pausing PID "<<incoming.process_id<<" in Ready Queue."<<std::endl;
+
+                BidMessage incoming = deserializeBid(buffer);
+
+                auto it = std::find_if(jobs.begin(), jobs.end(), [&](const Job& j) {
+                    return j.process_id == incoming.process_id;
+                });
+
+                if (it == jobs.end()) {
+                    Job newJob;
+                    newJob.process_id = incoming.process_id;
+                    newJob.bid_value = incoming.bid_value;
+                    newJob.remaining_work_ms = incoming.remaining_work_ms;
+                    newJob.balance = VcgAuctionPolicy::STARTING_BALANCE;
+                    newJob.round_arrived = round;
+                    jobs.push_back(newJob);
+                    std::cout << "New job PID " << incoming.process_id
+                              << " (bid=" << incoming.bid_value
+                              << ", work=" << incoming.remaining_work_ms << "ms)\n";
+                    if (kill(incoming.process_id, SIGSTOP) != 0) {
+                        std::cerr << "Warning: could not pause PID " << incoming.process_id
+                                  << ": " << strerror(errno) << "\n";
                     }
-                }   
+                } else {
+                    // Existing job re-bidding: the bidder is the
+                    // authority on its own remaining work (it's the one
+                    // actually executing), so we just trust its report.
+                    it->bid_value = incoming.bid_value;
+                    it->remaining_work_ms = incoming.remaining_work_ms;
+                }
             }
         }
-        std::cout << "Total active processes in pool: " << active_jobs.size() << std::endl;
-        if(active_jobs.empty())
-        {
-            std::cout<<"No process in queue. Scheduler idling..."<<std::endl;
+
+        // Drop jobs whose process has died or exited since we last saw
+        // it (e.g. finished all its work and returned).
+        jobs.erase(std::remove_if(jobs.begin(), jobs.end(), [](const Job& j) {
+            return j.finished || !isProcessAlive(j.process_id);
+        }), jobs.end());
+
+        std::cout << "Active jobs: " << jobs.size() << "\n";
+        if (jobs.empty()) {
+            round++;
             continue;
         }
-        int highest_bid=-1;
-        int second_highest_bid=-1;
-        pid_t winner_pid=-1;
-        for(const auto&bid: active_jobs)
-        {
-            // Cap their bid if they don't have enough money in the bank
-            int effective_bid=std::min(bid.value,accounts[bid.process_id]);
-            if(effective_bid>highest_bid)
-            {
-                second_highest_bid=highest_bid;
-                highest_bid=effective_bid;
-                winner_pid=bid.process_id;
-            }
-            else if(effective_bid>second_highest_bid)
-            {
-                second_highest_bid=effective_bid;
-            }
-        }
-        if(second_highest_bid==-1)
-        {
-            second_highest_bid=0;
-        }
-        accounts[winner_pid]-=second_highest_bid;
 
-        if(active_jobs.size()>1)
-        {
-            int tax=second_highest_bid;
-            if(tax==0)
-            {
-                tax=50;
-                std::cout<<"[SYSTEM BAILOUT] VCG Price hit 0. Injecting 50 credits to distribute."<<std::endl;
-            }
-            int share=tax/(active_jobs.size()-1);
-            for(const auto & job:active_jobs)
-            {
-                if(job.process_id!=winner_pid)
-                {
-                    accounts[job.process_id]+=share;
-                }
-            }
-            std::cout << "-> Robin Hood redistributed " << share << " credits to all paused processes." << std::endl;
+        std::vector<Job*> activePtrs;
+        activePtrs.reserve(jobs.size());
+        for (auto& j : jobs) activePtrs.push_back(&j);
+
+        Job* winner = policy.pickNext(activePtrs);
+        if (!winner) {
+            round++;
+            continue;
         }
-        std::cout<<"\n=== AUCTION RESULTS ==="<<std::endl;
-        std::cout<<"Winner PID: "<<winner_pid<<"(Bid: "<<highest_bid<<")"<<std::endl;
-        std::cout<<"VCG Price charged: "<<second_highest_bid<<std::endl;
-        std::cout<<"Winner's remaining balance: "<<accounts[winner_pid]<<std::endl;
-        if(currently_running_pid!=-1 && currently_running_pid!=winner_pid)
-        {
-            std::cout<<"\n[CONTEXT SWITCH] Preempting old winner PID "<<currently_running_pid<<"..."<<std::endl;
-            kill(currently_running_pid,SIGSTOP);
+        policy.onScheduled(*winner, activePtrs);
+
+        std::cout << "\n=== Round " << round << " result ===\n";
+        std::cout << "Winner PID " << winner->process_id
+                  << " | charged=" << policy.lastPriceCharged
+                  << " | balance=" << winner->balance
+                  << " | remaining_work=" << winner->remaining_work_ms << "ms\n";
+
+        if (currentlyRunningPid != -1 && currentlyRunningPid != winner->process_id) {
+            std::cout << "[CONTEXT SWITCH] Pausing previous winner PID "
+                      << currentlyRunningPid << "\n";
+            if (isProcessAlive(currentlyRunningPid)) kill(currentlyRunningPid, SIGSTOP);
         }
-        std::cout<<"\nResuming Winner PID "<<winner_pid<<"..."<<std::endl;
-        if(kill(winner_pid,SIGCONT)==-1)
-        {
-            std::cerr<<"Failed to send SIGCONT to PID "<<winner_pid<<std::endl;
+        if (kill(winner->process_id, SIGCONT) != 0) {
+            std::cerr << "Failed to resume PID " << winner->process_id
+                      << ": " << strerror(errno) << "\n";
+        } else {
+            currentlyRunningPid = winner->process_id;
         }
-        currently_running_pid=winner_pid;
+        winner->rounds_run++;
+
+        round++;
     }
+
+    std::cout << "\nShutting down - resuming any paused processes so none are left frozen...\n";
+    for (auto& j : jobs) {
+        if (isProcessAlive(j.process_id)) kill(j.process_id, SIGCONT);
+    }
+    close(sock);
     return 0;
 }
